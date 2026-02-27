@@ -1,0 +1,11 @@
+FROM ruby:3.3-slim
+
+RUN useradd --create-home --shell /bin/bash agent
+WORKDIR /home/agent
+
+COPY agent.rb /home/agent/agent.rb
+RUN chown agent:agent /home/agent/agent.rb
+
+USER agent
+EXPOSE 9867
+CMD ["ruby", "/home/agent/agent.rb"]

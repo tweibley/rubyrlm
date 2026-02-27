@@ -1,0 +1,9 @@
+/.bundle
+/vendor/bundle
+/logs
+/.rspec_status
+/pkg
+*.gem
+/Gemfile.lock
+.env
+test_export.html

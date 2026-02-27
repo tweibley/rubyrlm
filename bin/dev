@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+# Development server with hot reload
+# Usage: bin/dev [-p PORT]
+#
+# Uses sinatra-reloader to reload changed files on each request.
+
+ENV["APP_ENV"] ||= "development"
+
+port = ARGV.include?("-p") ? ARGV[ARGV.index("-p") + 1] : "8080"
+exec "ruby", "viewer.rb", "-p", port

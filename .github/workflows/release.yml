@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Run tests
+        run: bundle exec rspec
+
+      - name: Build gem
+        run: gem build rubyrlm.gemspec
+
+      - name: Push to RubyGems
+        uses: rubygems/release-gem@v1

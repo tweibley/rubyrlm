@@ -1,0 +1,168 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+$LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
+require "rubyrlm"
+require "optparse"
+
+options = {
+  model_name: "gemini-3.1-pro-preview",
+  environment: "local",
+  max_iterations: 30,
+  max_depth: 1,
+  iteration_timeout: 60,
+  thinking_level: "medium",
+  environment_options: {},
+  verbose: false,
+  log_dir: File.expand_path("../logs", __dir__)
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: rubyrlm [options] \"<prompt>\""
+
+  opts.on("-m", "--model MODEL", "Model name (default: gemini-3.1-pro-preview)") do |v|
+    options[:model_name] = v
+  end
+
+  opts.on("-e", "--env ENV", "Execution environment: local or docker (default: local)") do |v|
+    options[:environment] = v
+  end
+
+  opts.on("--max-iterations NUM", Integer, "Maximum iterations (default: 30)") do |v|
+    options[:max_iterations] = v
+  end
+
+  opts.on("--max-depth NUM", Integer, "Maximum recursion depth (default: 1)") do |v|
+    options[:max_depth] = v
+  end
+
+  opts.on("--timeout SECS", Integer, "Iteration execution timeout (default: 60)") do |v|
+    options[:iteration_timeout] = v
+  end
+
+  opts.on("--thinking LEVEL", "Thinking level: low|medium|high (default: medium)") do |v|
+    options[:thinking_level] = v
+  end
+
+  opts.on("--keep-alive", "Keep docker container alive after run") do
+    options[:environment_options][:keep_alive] = true
+  end
+
+  opts.on("--reuse-container-id ID", "Reuse existing docker container by its ID") do |v|
+    options[:environment_options][:reuse_container_id] = v
+  end
+
+  opts.on("--allow-network", "Allow docker container to access host networking") do
+    options[:environment_options][:allow_network] = true
+  end
+
+  opts.on("-v", "--verbose", "Enable verbose debug output") do
+    options[:verbose] = true
+  end
+
+  opts.on("-h", "--help", "Prints this help") do
+    puts opts
+    exit
+  end
+end
+
+parser.parse!
+
+prompt = ARGV.join(" ").strip
+if prompt.empty? && !STDIN.tty?
+  prompt = STDIN.read.strip
+end
+
+if prompt.empty?
+  puts parser.help
+  exit 1
+end
+
+api_key = ENV["GEMINI_API_KEY"]
+if api_key.to_s.strip.empty?
+  warn "Error: GEMINI_API_KEY is missing in environment."
+  exit 1
+end
+
+class MultiLogger
+  def initialize(*loggers)
+    @loggers = loggers.compact
+  end
+
+  def log(payload)
+    @loggers.each { |l| l.log(payload) }
+  rescue => e
+    warn "Logger error: #{e.message}"
+  end
+end
+
+class CliStreamer
+  def initialize
+    @in_chunk = false
+  end
+
+  def log(payload)
+    case payload[:type]
+    when "chunk"
+      print payload[:chunk]
+      @in_chunk = true
+    when "iteration"
+      puts "" if @in_chunk
+      @in_chunk = false
+      data = payload[:data]
+      if data && data[:action] == "exec"
+        puts "\n\n[Executing Ruby Code] ->"
+        puts "```ruby\n#{data[:code]}\n```"
+        if data[:execution]
+          puts "[Result: #{data[:execution][:ok] ? 'Success' : 'Failed'}]"
+          puts data[:execution][:output]
+          puts data[:execution][:error] if data[:execution][:error]
+        end
+        puts "-" * 40
+      end
+    when "run_error"
+      puts "" if @in_chunk
+      @in_chunk = false
+      puts "\n[Error] #{payload[:error]}"
+    end
+  end
+end
+
+cli_streamer = CliStreamer.new
+jsonl_logger = RubyRLM::Logger::JsonlLogger.new(log_dir: options[:log_dir])
+multi_logger = MultiLogger.new(cli_streamer, jsonl_logger)
+
+generation_config = {}
+if %w[low medium high].include?(options[:thinking_level].to_s.downcase)
+  generation_config[:thinking_config] = { thinkingLevel: options[:thinking_level].to_s.downcase }
+end
+
+client_kwargs = {
+  backend: "gemini",
+  api_key: api_key,
+  model_name: options[:model_name],
+  environment: options[:environment],
+  max_iterations: options[:max_iterations],
+  max_depth: options[:max_depth],
+  iteration_timeout: options[:iteration_timeout],
+  generation_config: generation_config,
+  verbose: options[:verbose],
+  streaming: true,
+  logger: multi_logger
+}
+client_kwargs[:environment_options] = options[:environment_options] unless options[:environment_options].empty?
+
+begin
+  client = RubyRLM::Client.new(**client_kwargs)
+rescue => e
+  warn "Failed to initialize client: #{e.message}"
+  exit 1
+end
+
+puts "=> Starting query..."
+
+result = client.completion(prompt: prompt)
+
+puts "\n\n=== Final Result ==="
+puts result.response
+puts "\n[Usage Summary: #{result.usage_summary.total_tokens} tokens | Cached: #{result.usage_summary.cached_content_tokens} | Cost: $#{'%.4f' % result.usage_summary.compute_total_usd_cost}]"

@@ -1,0 +1,18 @@
+require_relative "rubyrlm/version"
+require_relative "rubyrlm/errors"
+require_relative "rubyrlm/completion"
+require_relative "rubyrlm/pricing"
+require_relative "rubyrlm/backends/base"
+require_relative "rubyrlm/backends/gemini_rest"
+require_relative "rubyrlm/repl/execution_result"
+require_relative "rubyrlm/repl/code_validator"
+require_relative "rubyrlm/repl/local_repl"
+require_relative "rubyrlm/repl/docker_repl"
+require_relative "rubyrlm/prompts/system_prompt"
+require_relative "rubyrlm/protocol/action_parser"
+require_relative "rubyrlm/logger/jsonl_logger"
+require_relative "rubyrlm/sub_call_cache"
+require_relative "rubyrlm/client"
+
+module RubyRLM
+end
