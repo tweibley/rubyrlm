@@ -148,7 +148,7 @@ RSpec.describe RubyRLM::Repl::LocalRepl do
     end
   end
 
-  it "greps codebase with file and line metadata" do
+  it "greps codebase with file and line metadata", skip: (!system("which rg > /dev/null 2>&1") && "ripgrep (rg) not installed") do
     Dir.mktmpdir do |dir|
       previous = Dir.pwd
       begin

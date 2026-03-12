@@ -169,12 +169,19 @@ RSpec.describe RubyRLM::Web::Services::QueryService do
   it "broadcasts terminal events to multiple stream consumers" do
     service = described_class.new(log_dir: Dir.mktmpdir("rubyrlm-query-spec"))
     result = instance_double(RubyRLM::CompletionResult, response: "done", execution_time: 0.01)
-    fake_client = instance_double(RubyRLM::Client, completion: result)
+
+    # Use a latch so the worker thread waits until subscribers are attached.
+    latch = Queue.new
+    fake_client = instance_double(RubyRLM::Client)
+    allow(fake_client).to receive(:completion) { latch.pop; result }
     allow(RubyRLM::Client).to receive(:new).and_return(fake_client)
 
     run_id = service.start_run(prompt: "shared")
     stream_a = service.stream_events(run_id)
     stream_b = service.stream_events(run_id)
+
+    # Release the worker now that both subscribers are attached.
+    latch.push(:go)
 
     event_a = Timeout.timeout(2) { stream_a.next }
     event_b = Timeout.timeout(2) { stream_b.next }
