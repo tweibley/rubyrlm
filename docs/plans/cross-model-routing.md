@@ -1,6 +1,6 @@
 # Cross-Model Routing
 
-## Status: Planned
+## Status: Implemented
 
 ## Context
 

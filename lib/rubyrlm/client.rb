@@ -32,6 +32,7 @@ module RubyRLM
       compaction: DEFAULT_COMPACTION,
       compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
       compaction_model: DEFAULT_COMPACTION_MODEL,
+      subcall_model: nil,
       budget: nil,
       budget_tracker: nil,
       parent_run_id: nil,
@@ -71,6 +72,7 @@ module RubyRLM
         compaction_model: @compaction_model,
         backend_builder: method(:build_backend_client)
       )
+      @subcall_model = subcall_model
       @budget_tracker = budget_tracker || build_budget_tracker(budget)
       @current_run_id = nil
 
@@ -499,7 +501,7 @@ module RubyRLM
     end
 
     def llm_query(sub_prompt, model_name: nil)
-      effective_model = model_name || @model_name
+      effective_model = model_name || @subcall_model || @model_name
 
       # Check sub-call cache
       cached = @sub_call_cache.get(sub_prompt, model_name: effective_model)
@@ -538,6 +540,7 @@ module RubyRLM
           environment: @environment,
           environment_options: @environment_options,
           iteration_timeout: @iteration_timeout,
+          subcall_model: @subcall_model,
           budget_tracker: @budget_tracker,
           parent_run_id: @current_run_id,
           run_metadata: {},
@@ -551,8 +554,8 @@ module RubyRLM
 
       verbose_log("subcall_fallback", "depth=#{@depth} max_depth=#{@max_depth} using single-shot completion")
       plain_backend =
-        if model_name && model_name != @model_name
-          build_backend_client(model_name: model_name)
+        if effective_model != @model_name
+          build_backend_client(model_name: effective_model)
         else
           @backend_client
         end

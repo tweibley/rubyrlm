@@ -444,6 +444,89 @@ RSpec.describe RubyRLM::Client do
     end
   end
 
+  context "cross-model routing" do
+    it "routes subcalls to subcall_model by default" do
+      # Use the same model name so the subcall reuses the same backend
+      # and we can verify which calls were made
+      backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"sub-question\")"}' },
+        { text: "flash-answer" },
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0,
+        subcall_model: "gemini-2.0-flash-lite"
+      )
+
+      # Stub the backend builder to return a separate backend for the subcall model
+      subcall_backend = QueueBackend.new([{ text: "routed-answer" }])
+      allow(client).to receive(:build_backend_client)
+        .with(model_name: "gemini-2.0-flash-lite")
+        .and_return(subcall_backend)
+
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("root-done")
+      expect(subcall_backend.calls.length).to eq(1)
+    end
+
+    it "allows explicit model_name to override subcall_model" do
+      root_backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"sub\", model_name: \"gemini-2.5-pro\")"}' },
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+      pro_backend = QueueBackend.new([
+        { text: "pro-answer" }
+      ])
+
+      allow(RubyRLM::Backends::GeminiRest).to receive(:new)
+        .with(hash_including(model_name: "gemini-2.5-pro"))
+        .and_return(pro_backend)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: root_backend,
+        max_depth: 0,
+        subcall_model: "gemini-2.0-flash-lite"
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("root-done")
+      expect(pro_backend.calls.length).to eq(1)
+    end
+
+    it "falls back to main model when subcall_model is nil" do
+      backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"sub-question\")"}' },
+        { text: "sub-answer" },
+        { text: '{"action":"final","answer":"done"}' }
+      ])
+
+      expect(RubyRLM::Backends::GeminiRest).not_to receive(:new)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("done")
+      # All 3 calls went to the same backend (no new backend created)
+      expect(backend.calls.length).to eq(3)
+    end
+  end
+
+  it "includes model roster in system prompt" do
+    prompt = RubyRLM::Prompts::SystemPrompt.build
+    expect(prompt).to include("gemini-2.0-flash-lite")
+    expect(prompt).to include("gemini-2.5-pro")
+    expect(prompt).to include("model_name:")
+  end
+
   it "uses DockerRepl when environment is docker and shuts it down" do
     backend = QueueBackend.new(
       [

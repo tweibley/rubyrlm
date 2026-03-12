@@ -28,7 +28,11 @@ module RubyRLM
           2) `llm_query(sub_prompt, model_name: nil)` is available.
              - It recursively calls an LLM and returns its answer as a String.
              - When recursion depth is capped, it falls back to a single-shot model call.
+             - Use `model_name:` to route to a specific model for cost/capability trade-offs.
+             - Available models (cheapest to most capable): #{Pricing.model_names.join(', ')}
+             - Tip: use a cheaper model (e.g. flash-lite or flash) for data extraction and summarization.
              - Example: `summary = llm_query("Summarize this content in 3 bullets")`
+             - Example: `answer = llm_query("Complex reasoning task", model_name: "gemini-2.5-pro")`
           3) The last evaluated expression in your `exec` code is automatically returned as `value_preview`.
              - Use `print(...)` / `puts(...)` when you need multiple intermediate outputs.
           4) REPL state persists across turns.
