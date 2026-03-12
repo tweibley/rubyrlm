@@ -38,6 +38,8 @@ RSpec.describe RubyRLM::BudgetTracker do
     tracker.check_subcall!
     expect(tracker.exceeded?).to be false
     tracker.check_subcall!
+    expect(tracker.exceeded?).to be false
+    expect { tracker.check_subcall! }.to raise_error(RubyRLM::BudgetExceededError)
     expect(tracker.exceeded?).to be true
   end
 

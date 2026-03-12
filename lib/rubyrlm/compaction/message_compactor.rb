@@ -5,7 +5,7 @@ module RubyRLM
 
       DEFAULT_COMPACTION_MODEL = "gemini-2.0-flash-lite"
 
-      attr_reader :threshold, :compaction_model
+      attr_reader :enabled, :threshold, :compaction_model
 
       def initialize(enabled:, threshold:, max_messages:, backend_builder:, compaction_model: DEFAULT_COMPACTION_MODEL)
         @enabled = enabled
@@ -20,7 +20,7 @@ module RubyRLM
         return Result.new(compacted: false) unless should_compact?(messages)
 
         compact!(messages)
-      rescue StandardError => e
+      rescue RubyRLM::BackendError, IOError, SocketError, Timeout::Error => e
         raise CompactionError, "Compaction failed: #{e.message}"
       end
 

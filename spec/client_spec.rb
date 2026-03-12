@@ -352,7 +352,7 @@ RSpec.describe RubyRLM::Client do
 
       failing_backend = Class.new do
         def complete(messages:, generation_config: {})
-          raise "network timeout"
+          raise RubyRLM::BackendError, "network timeout"
         end
       end.new
 
@@ -371,6 +371,32 @@ RSpec.describe RubyRLM::Client do
       result = client.completion(prompt: "hello")
 
       expect(result.response).to eq("done")
+      expect(result.metadata[:compaction_events]).to be_empty
+    end
+
+    it "inherits compaction: false in child clients" do
+      shared_backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"What is 2+2?\")"}' },
+        # Child responses
+        { text: '{"action":"exec","code":"2 + 2"}' },
+        { text: '{"action":"final","answer":"4"}' },
+        # Root final
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+
+      # Compaction backend should never be instantiated when compaction is disabled
+      expect(RubyRLM::Backends::GeminiRest).not_to receive(:new)
+        .with(hash_including(model_name: "gemini-2.0-flash-lite"))
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: shared_backend,
+        max_depth: 1,
+        compaction: false
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("root-done")
       expect(result.metadata[:compaction_events]).to be_empty
     end
 
@@ -428,6 +454,48 @@ RSpec.describe RubyRLM::Client do
       expect(result.response).to eq("done")
       # 3 attempts: 2 succeeded, 3rd was blocked but still counted as an attempt
       expect(result.metadata[:budget][:subcalls]).to eq 3
+    end
+
+    it "returns CompletionResult when budget is exceeded in main loop" do
+      # gemini-2.5-flash: input=$0.15/1M, output=$0.60/1M
+      # With 10000 prompt + 10000 candidate tokens per response:
+      #   cost = (10000/1M * 0.15) + (10000/1M * 0.60) = 0.0015 + 0.006 = 0.0075
+      # Set max_cost_usd to 0.001 so the first iteration's charge_budget exceeds it
+      backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"1 + 1"}', usage: { prompt_tokens: 10_000, candidate_tokens: 10_000, total_tokens: 20_000 } },
+        { text: '{"action":"exec","code":"2 + 2"}', usage: { prompt_tokens: 10_000, candidate_tokens: 10_000, total_tokens: 20_000 } },
+        { text: '{"action":"final","answer":"budget-forced"}' }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_iterations: 10,
+        budget: { max_cost_usd: 0.001 }
+      )
+      result = client.completion(prompt: "hello")
+      expect(result).to be_a(RubyRLM::CompletionResult)
+      expect(result.response).not_to be_nil
+      expect(result.metadata).to be_a(Hash)
+    end
+
+    it "returns graceful message when budget exceeded in single-shot fallback" do
+      # First call is the single-shot fallback in llm_query (max_depth: 0)
+      # The response has high token counts to exceed the tiny budget
+      backend = QueueBackend.new([
+        { text: "fallback-answer", usage: { prompt_tokens: 10_000, candidate_tokens: 10_000, total_tokens: 20_000 } }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0,
+        budget: { max_cost_usd: 0.0001 }
+      )
+
+      answer = client.send(:llm_query, "sub-question")
+      expect(answer).to be_a(String)
+      expect(answer).to include("Budget exceeded")
     end
 
     it "does not add budget metadata when no budget configured" do

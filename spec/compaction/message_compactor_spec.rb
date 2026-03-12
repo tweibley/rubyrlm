@@ -95,7 +95,7 @@ RSpec.describe RubyRLM::Compaction::MessageCompactor do
   it "raises CompactionError when backend fails" do
     failing_backend = Class.new do
       def complete(messages:, generation_config: {})
-        raise "network timeout"
+        raise RubyRLM::BackendError, "network timeout"
       end
     end.new
 

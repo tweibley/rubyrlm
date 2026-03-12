@@ -51,9 +51,9 @@ module RubyRLM
 
     def exceeded?
       @mon.synchronize do
-        return true if @limits[:max_subcalls] && @subcalls >= @limits[:max_subcalls]
-        return true if @limits[:max_total_tokens] && @total_tokens >= @limits[:max_total_tokens]
-        return true if @limits[:max_cost_usd] && @total_cost >= @limits[:max_cost_usd]
+        return true if @limits[:max_subcalls] && @subcalls > @limits[:max_subcalls]
+        return true if @limits[:max_total_tokens] && @total_tokens > @limits[:max_total_tokens]
+        return true if @limits[:max_cost_usd] && @total_cost > @limits[:max_cost_usd]
 
         false
       end

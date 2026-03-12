@@ -242,6 +242,50 @@ RSpec.describe RubyRLM::Repl::LocalRepl do
       expect(result.ok).to be(false)
       expect(result.error_message).to include("boom")
     end
+
+    it "does not deadlock when query_proc creates child REPLs" do
+      query_proc = lambda { |prompt, model_name: nil|
+        child_repl = described_class.new(
+          context: "child",
+          llm_query_proc: ->(_p, model_name: nil) { "leaf" },
+          timeout_seconds: 2
+        )
+        result = child_repl.execute("context")
+        result.value_preview
+      }
+
+      repl = described_class.new(
+        context: "parent",
+        llm_query_proc: query_proc,
+        timeout_seconds: 5
+      )
+
+      result = repl.execute('results = parallel_queries("a", "b"); results.join(",")')
+      expect(result.ok).to be(true)
+      expect(result.stdout).to be_empty  # value_preview is returned, not printed
+    end
+
+    it "completes all threads before raising on error" do
+      completed_count = 0
+      mu = Mutex.new
+
+      repl = described_class.new(
+        context: "hello",
+        llm_query_proc: lambda { |prompt, model_name: nil|
+          sleep 0.05 if prompt != "b"
+          mu.synchronize { completed_count += 1 }
+          raise "boom" if prompt == "b"
+          "ok-#{prompt}"
+        },
+        timeout_seconds: 5
+      )
+
+      result = repl.execute('parallel_queries("a", "b", "c")')
+
+      expect(result.ok).to be(false)
+      expect(result.error_message).to include("boom")
+      expect(completed_count).to eq(3)
+    end
   end
 
   it "chunks text semantically under max length" do
