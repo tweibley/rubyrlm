@@ -1,6 +1,6 @@
 # Budget Guards
 
-## Status: Planned
+## Status: Implemented
 
 ## Context
 

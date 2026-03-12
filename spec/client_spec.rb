@@ -393,6 +393,57 @@ RSpec.describe RubyRLM::Client do
     end
   end
 
+  context "budget guards" do
+    it "surfaces budget stats in metadata" do
+      backend = QueueBackend.new([
+        { text: '{"action":"final","answer":"done"}', usage: { prompt_tokens: 100, candidate_tokens: 50, total_tokens: 150 } }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        budget: { max_subcalls: 10, max_cost_usd: 1.0 }
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.metadata[:budget]).to be_a(Hash)
+      expect(result.metadata[:budget][:limits]).to eq({ max_subcalls: 10, max_cost_usd: 1.0 })
+      expect(result.metadata[:budget][:total_tokens]).to eq 150
+    end
+
+    it "stops subcalls when max_subcalls exceeded" do
+      backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"r1 = llm_query(\"q1\"); r2 = llm_query(\"q2\"); r3 = llm_query(\"q3\")"}' },
+        { text: "answer-1" },
+        { text: "answer-2" },
+        { text: '{"action":"final","answer":"done"}' }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0,
+        budget: { max_subcalls: 2 }
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("done")
+      # 3 attempts: 2 succeeded, 3rd was blocked but still counted as an attempt
+      expect(result.metadata[:budget][:subcalls]).to eq 3
+    end
+
+    it "does not add budget metadata when no budget configured" do
+      backend = QueueBackend.new([
+        { text: '{"action":"final","answer":"done"}' }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.metadata[:budget]).to be_nil
+    end
+  end
+
   it "uses DockerRepl when environment is docker and shuts it down" do
     backend = QueueBackend.new(
       [

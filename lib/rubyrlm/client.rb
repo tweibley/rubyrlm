@@ -32,6 +32,8 @@ module RubyRLM
       compaction: DEFAULT_COMPACTION,
       compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
       compaction_model: DEFAULT_COMPACTION_MODEL,
+      budget: nil,
+      budget_tracker: nil,
       parent_run_id: nil,
       run_id: nil,
       run_metadata: {},
@@ -69,6 +71,7 @@ module RubyRLM
         compaction_model: @compaction_model,
         backend_builder: method(:build_backend_client)
       )
+      @budget_tracker = budget_tracker || build_budget_tracker(budget)
       @current_run_id = nil
 
       validate_config!
@@ -191,6 +194,7 @@ module RubyRLM
       end
       cache_stats = @sub_call_cache.stats
       metadata[:sub_call_cache] = cache_stats if cache_stats[:hits] > 0 || cache_stats[:misses] > 0
+      metadata[:budget] = @budget_tracker.stats if @budget_tracker
 
       result = CompletionResult.new(
         response: final_answer,
@@ -354,6 +358,7 @@ module RubyRLM
           request_action_blocking(messages: messages)
         end
       usage_summary.add(response[:usage], model: @model_name)
+      charge_budget(response[:usage])
       raw_text = response.fetch(:text).to_s
       action = @action_parser.parse(raw_text)
       {
@@ -371,6 +376,7 @@ module RubyRLM
       ]
       repaired = request_action_blocking(messages: repair_messages)
       usage_summary.add(repaired[:usage], model: @model_name)
+      charge_budget(repaired[:usage])
       repaired_raw = repaired.fetch(:text).to_s
       action = @action_parser.parse(repaired_raw)
       verbose_block("repaired_action_response", repaired_raw)
@@ -502,6 +508,16 @@ module RubyRLM
         return cached
       end
 
+      # Check budget before making a subcall
+      if @budget_tracker
+        begin
+          @budget_tracker.check_subcall!
+        rescue BudgetExceededError => e
+          verbose_log("budget_exceeded", e.message)
+          return "[Budget exceeded: #{e.message}]"
+        end
+      end
+
       if @depth < @max_depth
         verbose_log(
           "subcall_start",
@@ -522,6 +538,7 @@ module RubyRLM
           environment: @environment,
           environment_options: @environment_options,
           iteration_timeout: @iteration_timeout,
+          budget_tracker: @budget_tracker,
           parent_run_id: @current_run_id,
           run_metadata: {},
           backend_client: effective_model == @model_name ? @backend_client : nil
@@ -609,6 +626,29 @@ module RubyRLM
         }
         verbose_block("exec_result", JSON.pretty_generate(summary))
       end
+    end
+
+    def build_budget_tracker(budget)
+      return nil if budget.nil? || (budget.is_a?(Hash) && budget.empty?)
+
+      opts = budget.each_with_object({}) { |(k, v), h| h[k.to_sym] = v }
+      BudgetTracker.new(**opts)
+    end
+
+    def charge_budget(usage_hash)
+      return unless @budget_tracker
+      return unless usage_hash.is_a?(Hash)
+
+      tokens = Integer(usage_hash[:total_tokens] || usage_hash["total_tokens"] || 0)
+      cost = Pricing.cost_for(
+        model: @model_name,
+        input_tokens: Integer(usage_hash[:prompt_tokens] || usage_hash["prompt_tokens"] || 0),
+        cached_tokens: Integer(usage_hash[:cached_content_tokens] || usage_hash["cached_content_tokens"] || 0),
+        output_tokens: Integer(usage_hash[:candidate_tokens] || usage_hash["candidate_tokens"] || 0)
+      )
+      @budget_tracker.add_usage(tokens: tokens, cost: cost)
+    rescue BudgetExceededError => e
+      verbose_log("budget_exceeded", e.message)
     end
 
     def indent_multiline(text)

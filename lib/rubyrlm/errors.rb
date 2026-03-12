@@ -7,4 +7,5 @@ module RubyRLM
   class TimeoutError < ReplError; end
   class CodeValidationError < ReplError; end
   class CompactionError < Error; end
+  class BudgetExceededError < Error; end
 end
