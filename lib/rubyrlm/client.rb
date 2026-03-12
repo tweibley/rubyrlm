@@ -546,10 +546,11 @@ module RubyRLM
           run_metadata: {},
           backend_client: effective_model == @model_name ? @backend_client : nil
         )
-        response = child.completion(prompt: sub_prompt, root_prompt: "Recursive sub-call. Solve only this scoped sub-problem.").response
-        verbose_block("subcall_end", response)
-        @sub_call_cache.put(sub_prompt, model_name: effective_model, response: response)
-        return response
+        child_result = child.completion(prompt: sub_prompt, root_prompt: "Recursive sub-call. Solve only this scoped sub-problem.")
+        episode_result = build_episode_result(child_result)
+        verbose_block("subcall_end", episode_result)
+        @sub_call_cache.put(sub_prompt, model_name: effective_model, response: episode_result)
+        return episode_result
       end
 
       verbose_log("subcall_fallback", "depth=#{@depth} max_depth=#{@max_depth} using single-shot completion")
@@ -629,6 +630,41 @@ module RubyRLM
         }
         verbose_block("exec_result", JSON.pretty_generate(summary))
       end
+    end
+
+    def build_episode_result(child_result)
+      iterations = child_result.metadata[:iterations] || []
+      episode = generate_episode_summary(iterations)
+      EpisodeResult.new(
+        child_result.response,
+        episode: episode,
+        iterations: iterations.length,
+        forced_final: child_result.metadata[:forced_final] || false
+      )
+    rescue StandardError => e
+      verbose_log("episode_error", "failed to generate episode: #{e.message}")
+      EpisodeResult.new(child_result.response, iterations: (child_result.metadata[:iterations] || []).length)
+    end
+
+    def generate_episode_summary(iterations)
+      return nil if iterations.empty?
+
+      parts = iterations.map do |iter|
+        case iter[:action]
+        when "exec"
+          exec_data = iter[:execution] || {}
+          status = exec_data[:ok] ? "ok" : "error: #{exec_data[:error_class]}"
+          "Step #{iter[:iteration]}: exec `#{truncate(iter[:code].to_s, 100)}` → #{status}"
+        when "final"
+          "Step #{iter[:iteration]}: final answer"
+        when "forced_final"
+          "Step #{iter[:iteration]}: forced final (iteration limit)"
+        else
+          "Step #{iter[:iteration]}: #{iter[:action]}"
+        end
+      end
+
+      parts.join("\n")
     end
 
     def build_budget_tracker(budget)

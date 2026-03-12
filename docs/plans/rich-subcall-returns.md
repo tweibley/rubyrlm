@@ -1,6 +1,6 @@
 # Rich Subcall Returns (Episodic Memory)
 
-## Status: Planned
+## Status: Implemented
 
 ## Context
 

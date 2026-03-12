@@ -31,6 +31,9 @@ module RubyRLM
              - Use `model_name:` to route to a specific model for cost/capability trade-offs.
              - Available models (cheapest to most capable): #{Pricing.model_names.join(', ')}
              - Tip: use a cheaper model (e.g. flash-lite or flash) for data extraction and summarization.
+             - When recursion is available, the return value carries episode metadata:
+               `result.episode` (summary of steps taken), `result.iterations` (count), `result.forced_final` (bool).
+             - The return value works as a plain String in all contexts (backward compatible).
              - Example: `summary = llm_query("Summarize this content in 3 bullets")`
              - Example: `answer = llm_query("Complex reasoning task", model_name: "gemini-2.5-pro")`
           3) The last evaluated expression in your `exec` code is automatically returned as `value_preview`.

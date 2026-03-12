@@ -520,6 +520,65 @@ RSpec.describe RubyRLM::Client do
     end
   end
 
+  context "rich subcall returns" do
+    it "returns EpisodeResult with episode metadata from recursive subcalls" do
+      shared_backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"What is 2+2?\")"}' },
+        # Child responses: exec then final
+        { text: '{"action":"exec","code":"2 + 2"}' },
+        { text: '{"action":"final","answer":"4"}' },
+        # Root final
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        max_depth: 1,
+        backend_client: shared_backend
+      )
+      result = client.completion(prompt: "compute")
+      expect(result.response).to eq("root-done")
+
+      # Verify the child iteration logged exec+final
+      child_starts = result.metadata[:iterations].select { |i| i[:action] == "exec" }
+      expect(child_starts).not_to be_empty
+    end
+
+    it "returns EpisodeResult that works as a String" do
+      shared_backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"q\"); puts @sub.class; puts @sub.length"}' },
+        { text: '{"action":"final","answer":"child-answer"}' },
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        max_depth: 1,
+        backend_client: shared_backend
+      )
+      result = client.completion(prompt: "compute")
+      expect(result.response).to eq("root-done")
+    end
+
+    it "returns plain string from single-shot fallback" do
+      backend = QueueBackend.new([
+        { text: "direct-answer" }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0
+      )
+      answer = client.send(:llm_query, "question")
+      expect(answer).to eq("direct-answer")
+      expect(answer).to be_a(String)
+      expect(answer).not_to be_a(RubyRLM::EpisodeResult)
+    end
+  end
+
   it "includes model roster in system prompt" do
     prompt = RubyRLM::Prompts::SystemPrompt.build
     expect(prompt).to include("gemini-2.0-flash-lite")
