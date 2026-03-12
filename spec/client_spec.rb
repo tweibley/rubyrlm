@@ -280,7 +280,8 @@ RSpec.describe RubyRLM::Client do
       api_key: "test-key",
       backend_client: backend,
       max_iterations: 10,
-      max_messages: 6
+      max_messages: 6,
+      compaction: false
     )
 
     result = client.completion(prompt: "hello")
@@ -288,6 +289,108 @@ RSpec.describe RubyRLM::Client do
     expect(backend.calls.last[:messages].length).to be <= 6
     expect(backend.calls.last[:messages][0][:role]).to eq("system")
     expect(backend.calls.last[:messages][1][:role]).to eq("user")
+  end
+
+  context "compaction" do
+    it "fires compaction and records event in metadata" do
+      # max_messages: 6, threshold: 0.5 → trigger at ceil(6 * 0.5) = 3
+      # initial_messages = 2, after first exec+feedback = 4 → triggers compaction
+      responses = [
+        { text: '{"action":"exec","code":"1 + 1"}' },
+        { text: '{"action":"final","answer":"done"}' }
+      ]
+      main_backend = QueueBackend.new(responses)
+      compaction_backend = QueueBackend.new([
+        { text: "Summary: computed 1+1 = 2." }
+      ])
+
+      allow(RubyRLM::Backends::GeminiRest).to receive(:new)
+        .with(hash_including(model_name: "gemini-2.0-flash-lite"))
+        .and_return(compaction_backend)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: main_backend,
+        max_messages: 6,
+        compaction: true,
+        compaction_threshold: 0.5
+      )
+      result = client.completion(prompt: "hello")
+
+      expect(result.response).to eq("done")
+      expect(result.metadata[:compaction_events]).not_to be_empty
+      event = result.metadata[:compaction_events].first
+      expect(event[:model]).to eq("gemini-2.0-flash-lite")
+      expect(event[:messages_before]).to be >= 4
+      expect(event[:messages_after]).to eq(3)
+    end
+
+    it "does not compact when disabled" do
+      responses = [
+        { text: '{"action":"exec","code":"1 + 1"}' },
+        { text: '{"action":"final","answer":"done"}' }
+      ]
+      backend = QueueBackend.new(responses)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        compaction: false
+      )
+      result = client.completion(prompt: "hello")
+
+      expect(result.response).to eq("done")
+      expect(result.metadata[:compaction_events]).to be_empty
+    end
+
+    it "falls back to truncation on compaction error" do
+      responses = Array.new(4) { { text: '{"action":"exec","code":"1 + 1"}' } }
+      responses << { text: '{"action":"final","answer":"done"}' }
+      main_backend = QueueBackend.new(responses)
+
+      failing_backend = Class.new do
+        def complete(messages:, generation_config: {})
+          raise "network timeout"
+        end
+      end.new
+
+      allow(RubyRLM::Backends::GeminiRest).to receive(:new)
+        .with(hash_including(model_name: "gemini-2.0-flash-lite"))
+        .and_return(failing_backend)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: main_backend,
+        max_messages: 6,
+        compaction: true,
+        compaction_threshold: 0.5
+      )
+      result = client.completion(prompt: "hello")
+
+      expect(result.response).to eq("done")
+      expect(result.metadata[:compaction_events]).to be_empty
+    end
+
+    it "raises ConfigurationError for invalid compaction_threshold" do
+      expect {
+        described_class.new(
+          model_name: "gemini-2.5-flash",
+          api_key: "test-key",
+          compaction_threshold: 0.0
+        )
+      }.to raise_error(RubyRLM::ConfigurationError, /compaction_threshold/)
+
+      expect {
+        described_class.new(
+          model_name: "gemini-2.5-flash",
+          api_key: "test-key",
+          compaction_threshold: 1.5
+        )
+      }.to raise_error(RubyRLM::ConfigurationError, /compaction_threshold/)
+    end
   end
 
   it "uses DockerRepl when environment is docker and shuts it down" do

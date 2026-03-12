@@ -7,6 +7,9 @@ module RubyRLM
     DEFAULT_MAX_ITERATIONS = 30
     DEFAULT_ITERATION_TIMEOUT = 60
     DEFAULT_MAX_MESSAGES = 50
+    DEFAULT_COMPACTION = true
+    DEFAULT_COMPACTION_THRESHOLD = 0.7
+    DEFAULT_COMPACTION_MODEL = Compaction::MessageCompactor::DEFAULT_COMPACTION_MODEL
 
     attr_reader :backend, :model_name, :max_depth, :max_iterations, :max_messages, :depth
 
@@ -26,6 +29,9 @@ module RubyRLM
       environment_options: {},
       iteration_timeout: DEFAULT_ITERATION_TIMEOUT,
       max_messages: DEFAULT_MAX_MESSAGES,
+      compaction: DEFAULT_COMPACTION,
+      compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
+      compaction_model: DEFAULT_COMPACTION_MODEL,
       parent_run_id: nil,
       run_id: nil,
       run_metadata: {},
@@ -55,6 +61,14 @@ module RubyRLM
       @action_parser = Protocol::ActionParser.new
       @backend_client = backend_client || build_backend_client(model_name: @model_name)
       @sub_call_cache = SubCallCache.new
+      @compaction_model = compaction_model.to_s
+      @compactor = Compaction::MessageCompactor.new(
+        enabled: compaction.nil? ? true : compaction,
+        threshold: compaction_threshold,
+        max_messages: @max_messages,
+        compaction_model: @compaction_model,
+        backend_builder: method(:build_backend_client)
+      )
       @current_run_id = nil
 
       validate_config!
@@ -75,7 +89,8 @@ module RubyRLM
         depth: @depth,
         max_depth: @max_depth,
         max_iterations: @max_iterations,
-        iterations: []
+        iterations: [],
+        compaction_events: []
       }
       metadata[:container_id] = repl.container_id if repl.respond_to?(:container_id) && repl.container_id
 
@@ -126,7 +141,7 @@ module RubyRLM
           feedback = execution_feedback(execution)
           messages << { role: "assistant", content: raw_text }
           messages << { role: "user", content: feedback }
-          truncate_messages!(messages)
+          maybe_compact_and_truncate!(messages, metadata: metadata, usage_summary: usage_summary)
           iteration_data = {
             iteration: iteration,
             action: "exec",
@@ -204,6 +219,8 @@ module RubyRLM
       raise ConfigurationError, "max_depth must be >= 0" if @max_depth.to_i.negative?
       raise ConfigurationError, "max_iterations must be > 0" unless @max_iterations.to_i.positive?
       raise ConfigurationError, "max_messages must be >= 4" unless @max_messages.to_i >= 4
+      raise ConfigurationError, "compaction_threshold must be between 0.1 and 1.0" unless
+        @compactor.threshold.between?(0.1, 1.0)
     end
 
     def validate_docker_options!
@@ -596,6 +613,28 @@ module RubyRLM
 
     def indent_multiline(text)
       text.lines.map { |line| "  #{line}" }.join
+    end
+
+    def maybe_compact_and_truncate!(messages, metadata:, usage_summary:)
+      result = @compactor.maybe_compact!(messages)
+      if result.compacted
+        usage_summary.add(result.usage, model: @compaction_model)
+        metadata[:compaction_events] << {
+          messages_before: result.messages_before,
+          messages_after: result.messages_after,
+          latency_s: result.latency_s,
+          model: @compaction_model
+        }
+        verbose_log(
+          "compaction",
+          "compacted #{result.messages_before} -> #{result.messages_after} messages in #{format('%.2f', result.latency_s)}s"
+        )
+      end
+      truncate_messages!(messages)
+    rescue CompactionError => e
+      verbose_log("compaction_error", "falling back to truncation: #{e.message}")
+      log_event(type: "compaction_error", run_id: @current_run_id, error: e.message)
+      truncate_messages!(messages)
     end
 
     def truncate_messages!(messages)
