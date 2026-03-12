@@ -34,6 +34,19 @@ RSpec.describe RubyRLM::SubCallCache do
     expect(cache.get("prompt-2", model_name: "m")).to eq("r2")
   end
 
+  it "is thread-safe for concurrent get and put" do
+    threads = 20.times.map do |i|
+      Thread.new do
+        cache.put("q#{i}", model_name: "m", response: "a#{i}")
+        cache.get("q#{i}", model_name: "m")
+      end
+    end
+    threads.each(&:join)
+
+    expect(cache.size).to eq(20)
+    expect(cache.hits).to eq(20)
+  end
+
   it "tracks stats accurately across multiple operations" do
     cache.put("q1", model_name: "m", response: "a1")
 

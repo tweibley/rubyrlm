@@ -1,6 +1,6 @@
 # Parallel Subcall Dispatch
 
-## Status: Planned
+## Status: Implemented
 
 ## Context
 

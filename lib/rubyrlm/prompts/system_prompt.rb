@@ -49,7 +49,13 @@ module RubyRLM
              - It raises if `old_text` is missing, appears multiple times, or filesystem access is disabled.
           8) `grep(pattern, path: ".")` searches with ripgrep when filesystem access is available.
              - Returns an array of `{path:, line:, text:}` matches.
-          9) `chunk_text(text, max_length: 2000)` splits long text semantically.
+          9) `parallel_queries(*prompts, max_concurrency: 5)` runs multiple `llm_query` calls concurrently.
+             - Accepts strings or hashes with `{prompt:, model_name:}` for per-query model routing.
+             - Returns an array of results in the same order as the input prompts.
+             - Use for independent subtasks: summarizing multiple chunks, analyzing multiple files, etc.
+             - Example: `results = parallel_queries("Summarize A", "Summarize B", "Summarize C")`
+             - Example: `results = parallel_queries({prompt: "Q1", model_name: "gemini-2.5-flash"}, {prompt: "Q2"})`
+          10) `chunk_text(text, max_length: 2000)` splits long text semantically.
              - It prefers paragraph/sentence boundaries before hard wrapping.
 
           Runtime environment:

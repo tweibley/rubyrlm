@@ -176,6 +176,21 @@ module RubyRLM
         @host.define_singleton_method(:chunk_text) do |text, max_length: 2000|
           chunk_proc.call(text, max_length: max_length)
         end
+        @host.define_singleton_method(:parallel_queries) do |*queries, max_concurrency: 5|
+          queries = queries.flatten
+          queries.each_slice(max_concurrency).flat_map do |batch|
+            threads = batch.map do |q|
+              Thread.new do
+                if q.is_a?(Hash)
+                  query_proc.call(q[:prompt] || q["prompt"], model_name: q[:model_name] || q["model_name"])
+                else
+                  query_proc.call(q.to_s)
+                end
+              end
+            end
+            threads.map(&:value)
+          end
+        end
       end
 
       def fetch_url(url, headers: {}, max_redirects: 5)

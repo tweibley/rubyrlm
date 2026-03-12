@@ -166,6 +166,84 @@ RSpec.describe RubyRLM::Repl::LocalRepl do
     end
   end
 
+  describe "parallel_queries" do
+    it "returns results in input order" do
+      call_count = 0
+      repl = described_class.new(
+        context: "hello",
+        llm_query_proc: lambda { |prompt, model_name: nil|
+          call_count += 1
+          "result-#{prompt}"
+        },
+        timeout_seconds: 5
+      )
+
+      result = repl.execute('results = parallel_queries("a", "b", "c"); puts results.join(",")')
+
+      expect(result.ok).to be(true)
+      expect(result.stdout.strip).to eq("result-a,result-b,result-c")
+    end
+
+    it "supports hash input with prompt and model_name" do
+      received = []
+      repl = described_class.new(
+        context: "hello",
+        llm_query_proc: lambda { |prompt, model_name: nil|
+          received << { prompt: prompt, model_name: model_name }
+          "ok-#{prompt}"
+        },
+        timeout_seconds: 5
+      )
+
+      result = repl.execute('results = parallel_queries({prompt: "q1", model_name: "fast"}, {prompt: "q2", model_name: "pro"}); puts results.join(",")')
+
+      expect(result.ok).to be(true)
+      expect(result.stdout.strip).to eq("ok-q1,ok-q2")
+      expect(received).to contain_exactly(
+        { prompt: "q1", model_name: "fast" },
+        { prompt: "q2", model_name: "pro" }
+      )
+    end
+
+    it "respects max_concurrency batching" do
+      concurrent_count = 0
+      max_concurrent = 0
+      mu = Mutex.new
+
+      repl = described_class.new(
+        context: "hello",
+        llm_query_proc: lambda { |prompt, model_name: nil|
+          mu.synchronize { concurrent_count += 1; max_concurrent = [max_concurrent, concurrent_count].max }
+          sleep 0.05
+          mu.synchronize { concurrent_count -= 1 }
+          "done"
+        },
+        timeout_seconds: 5
+      )
+
+      result = repl.execute('parallel_queries("a", "b", "c", "d", "e", max_concurrency: 2)')
+
+      expect(result.ok).to be(true)
+      expect(max_concurrent).to be <= 2
+    end
+
+    it "propagates errors from individual queries" do
+      repl = described_class.new(
+        context: "hello",
+        llm_query_proc: lambda { |prompt, model_name: nil|
+          raise "boom" if prompt == "b"
+          "ok-#{prompt}"
+        },
+        timeout_seconds: 5
+      )
+
+      result = repl.execute('parallel_queries("a", "b", "c")')
+
+      expect(result.ok).to be(false)
+      expect(result.error_message).to include("boom")
+    end
+  end
+
   it "chunks text semantically under max length" do
     repl = build_repl
     result = repl.execute('text = "Alpha sentence. Beta sentence.\n\nGamma sentence. Delta sentence."; chunks = chunk_text(text, max_length: 30); puts chunks.length; puts chunks.all? { |chunk| chunk.length <= 30 }')
