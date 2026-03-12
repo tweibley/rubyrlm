@@ -2,6 +2,8 @@
 
 RubyRLM is an MVP Ruby implementation of Recursive Language Models (RLMs) that uses Gemini as the model backend and a Ruby REPL for iterative reasoning.
 
+![RubyRLM Architecture](docs/architecture.png)
+
 ## What This MVP Includes
 
 - `RubyRLM::Client` API similar to `rlm.completion(...)`.
