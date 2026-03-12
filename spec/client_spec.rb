@@ -280,7 +280,8 @@ RSpec.describe RubyRLM::Client do
       api_key: "test-key",
       backend_client: backend,
       max_iterations: 10,
-      max_messages: 6
+      max_messages: 6,
+      compaction: false
     )
 
     result = client.completion(prompt: "hello")
@@ -288,6 +289,369 @@ RSpec.describe RubyRLM::Client do
     expect(backend.calls.last[:messages].length).to be <= 6
     expect(backend.calls.last[:messages][0][:role]).to eq("system")
     expect(backend.calls.last[:messages][1][:role]).to eq("user")
+  end
+
+  context "compaction" do
+    it "fires compaction and records event in metadata" do
+      # max_messages: 6, threshold: 0.5 → trigger at ceil(6 * 0.5) = 3
+      # initial_messages = 2, after first exec+feedback = 4 → triggers compaction
+      responses = [
+        { text: '{"action":"exec","code":"1 + 1"}' },
+        { text: '{"action":"final","answer":"done"}' }
+      ]
+      main_backend = QueueBackend.new(responses)
+      compaction_backend = QueueBackend.new([
+        { text: "Summary: computed 1+1 = 2." }
+      ])
+
+      allow(RubyRLM::Backends::GeminiRest).to receive(:new)
+        .with(hash_including(model_name: "gemini-2.0-flash-lite"))
+        .and_return(compaction_backend)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: main_backend,
+        max_messages: 6,
+        compaction: true,
+        compaction_threshold: 0.5
+      )
+      result = client.completion(prompt: "hello")
+
+      expect(result.response).to eq("done")
+      expect(result.metadata[:compaction_events]).not_to be_empty
+      event = result.metadata[:compaction_events].first
+      expect(event[:model]).to eq("gemini-2.0-flash-lite")
+      expect(event[:messages_before]).to be >= 4
+      expect(event[:messages_after]).to eq(3)
+    end
+
+    it "does not compact when disabled" do
+      responses = [
+        { text: '{"action":"exec","code":"1 + 1"}' },
+        { text: '{"action":"final","answer":"done"}' }
+      ]
+      backend = QueueBackend.new(responses)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        compaction: false
+      )
+      result = client.completion(prompt: "hello")
+
+      expect(result.response).to eq("done")
+      expect(result.metadata[:compaction_events]).to be_empty
+    end
+
+    it "falls back to truncation on compaction error" do
+      responses = Array.new(4) { { text: '{"action":"exec","code":"1 + 1"}' } }
+      responses << { text: '{"action":"final","answer":"done"}' }
+      main_backend = QueueBackend.new(responses)
+
+      failing_backend = Class.new do
+        def complete(messages:, generation_config: {})
+          raise RubyRLM::BackendError, "network timeout"
+        end
+      end.new
+
+      allow(RubyRLM::Backends::GeminiRest).to receive(:new)
+        .with(hash_including(model_name: "gemini-2.0-flash-lite"))
+        .and_return(failing_backend)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: main_backend,
+        max_messages: 6,
+        compaction: true,
+        compaction_threshold: 0.5
+      )
+      result = client.completion(prompt: "hello")
+
+      expect(result.response).to eq("done")
+      expect(result.metadata[:compaction_events]).to be_empty
+    end
+
+    it "inherits compaction: false in child clients" do
+      shared_backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"What is 2+2?\")"}' },
+        # Child responses
+        { text: '{"action":"exec","code":"2 + 2"}' },
+        { text: '{"action":"final","answer":"4"}' },
+        # Root final
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+
+      # Compaction backend should never be instantiated when compaction is disabled
+      expect(RubyRLM::Backends::GeminiRest).not_to receive(:new)
+        .with(hash_including(model_name: "gemini-2.0-flash-lite"))
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: shared_backend,
+        max_depth: 1,
+        compaction: false
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("root-done")
+      expect(result.metadata[:compaction_events]).to be_empty
+    end
+
+    it "raises ConfigurationError for invalid compaction_threshold" do
+      expect {
+        described_class.new(
+          model_name: "gemini-2.5-flash",
+          api_key: "test-key",
+          compaction_threshold: 0.0
+        )
+      }.to raise_error(RubyRLM::ConfigurationError, /compaction_threshold/)
+
+      expect {
+        described_class.new(
+          model_name: "gemini-2.5-flash",
+          api_key: "test-key",
+          compaction_threshold: 1.5
+        )
+      }.to raise_error(RubyRLM::ConfigurationError, /compaction_threshold/)
+    end
+  end
+
+  context "budget guards" do
+    it "surfaces budget stats in metadata" do
+      backend = QueueBackend.new([
+        { text: '{"action":"final","answer":"done"}', usage: { prompt_tokens: 100, candidate_tokens: 50, total_tokens: 150 } }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        budget: { max_subcalls: 10, max_cost_usd: 1.0 }
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.metadata[:budget]).to be_a(Hash)
+      expect(result.metadata[:budget][:limits]).to eq({ max_subcalls: 10, max_cost_usd: 1.0 })
+      expect(result.metadata[:budget][:total_tokens]).to eq 150
+    end
+
+    it "stops subcalls when max_subcalls exceeded" do
+      backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"r1 = llm_query(\"q1\"); r2 = llm_query(\"q2\"); r3 = llm_query(\"q3\")"}' },
+        { text: "answer-1" },
+        { text: "answer-2" },
+        { text: '{"action":"final","answer":"done"}' }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0,
+        budget: { max_subcalls: 2 }
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("done")
+      # 3 attempts: 2 succeeded, 3rd was blocked but still counted as an attempt
+      expect(result.metadata[:budget][:subcalls]).to eq 3
+    end
+
+    it "returns CompletionResult when budget is exceeded in main loop" do
+      # gemini-2.5-flash: input=$0.15/1M, output=$0.60/1M
+      # With 10000 prompt + 10000 candidate tokens per response:
+      #   cost = (10000/1M * 0.15) + (10000/1M * 0.60) = 0.0015 + 0.006 = 0.0075
+      # Set max_cost_usd to 0.001 so the first iteration's charge_budget exceeds it
+      backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"1 + 1"}', usage: { prompt_tokens: 10_000, candidate_tokens: 10_000, total_tokens: 20_000 } },
+        { text: '{"action":"exec","code":"2 + 2"}', usage: { prompt_tokens: 10_000, candidate_tokens: 10_000, total_tokens: 20_000 } },
+        { text: '{"action":"final","answer":"budget-forced"}' }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_iterations: 10,
+        budget: { max_cost_usd: 0.001 }
+      )
+      result = client.completion(prompt: "hello")
+      expect(result).to be_a(RubyRLM::CompletionResult)
+      expect(result.response).not_to be_nil
+      expect(result.metadata).to be_a(Hash)
+    end
+
+    it "returns graceful message when budget exceeded in single-shot fallback" do
+      # First call is the single-shot fallback in llm_query (max_depth: 0)
+      # The response has high token counts to exceed the tiny budget
+      backend = QueueBackend.new([
+        { text: "fallback-answer", usage: { prompt_tokens: 10_000, candidate_tokens: 10_000, total_tokens: 20_000 } }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0,
+        budget: { max_cost_usd: 0.0001 }
+      )
+
+      answer = client.send(:llm_query, "sub-question")
+      expect(answer).to be_a(String)
+      expect(answer).to include("Budget exceeded")
+    end
+
+    it "does not add budget metadata when no budget configured" do
+      backend = QueueBackend.new([
+        { text: '{"action":"final","answer":"done"}' }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.metadata[:budget]).to be_nil
+    end
+  end
+
+  context "cross-model routing" do
+    it "routes subcalls to subcall_model by default" do
+      # Use the same model name so the subcall reuses the same backend
+      # and we can verify which calls were made
+      backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"sub-question\")"}' },
+        { text: "flash-answer" },
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0,
+        subcall_model: "gemini-2.0-flash-lite"
+      )
+
+      # Stub the backend builder to return a separate backend for the subcall model
+      subcall_backend = QueueBackend.new([{ text: "routed-answer" }])
+      allow(client).to receive(:build_backend_client)
+        .with(model_name: "gemini-2.0-flash-lite")
+        .and_return(subcall_backend)
+
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("root-done")
+      expect(subcall_backend.calls.length).to eq(1)
+    end
+
+    it "allows explicit model_name to override subcall_model" do
+      root_backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"sub\", model_name: \"gemini-2.5-pro\")"}' },
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+      pro_backend = QueueBackend.new([
+        { text: "pro-answer" }
+      ])
+
+      allow(RubyRLM::Backends::GeminiRest).to receive(:new)
+        .with(hash_including(model_name: "gemini-2.5-pro"))
+        .and_return(pro_backend)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: root_backend,
+        max_depth: 0,
+        subcall_model: "gemini-2.0-flash-lite"
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("root-done")
+      expect(pro_backend.calls.length).to eq(1)
+    end
+
+    it "falls back to main model when subcall_model is nil" do
+      backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"sub-question\")"}' },
+        { text: "sub-answer" },
+        { text: '{"action":"final","answer":"done"}' }
+      ])
+
+      expect(RubyRLM::Backends::GeminiRest).not_to receive(:new)
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0
+      )
+      result = client.completion(prompt: "hello")
+      expect(result.response).to eq("done")
+      # All 3 calls went to the same backend (no new backend created)
+      expect(backend.calls.length).to eq(3)
+    end
+  end
+
+  context "rich subcall returns" do
+    it "returns EpisodeResult with episode metadata from recursive subcalls" do
+      shared_backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"What is 2+2?\")"}' },
+        # Child responses: exec then final
+        { text: '{"action":"exec","code":"2 + 2"}' },
+        { text: '{"action":"final","answer":"4"}' },
+        # Root final
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        max_depth: 1,
+        backend_client: shared_backend
+      )
+      result = client.completion(prompt: "compute")
+      expect(result.response).to eq("root-done")
+
+      # Verify the child iteration logged exec+final
+      child_starts = result.metadata[:iterations].select { |i| i[:action] == "exec" }
+      expect(child_starts).not_to be_empty
+    end
+
+    it "returns EpisodeResult that works as a String" do
+      shared_backend = QueueBackend.new([
+        { text: '{"action":"exec","code":"@sub = llm_query(\"q\"); puts @sub.class; puts @sub.length"}' },
+        { text: '{"action":"final","answer":"child-answer"}' },
+        { text: '{"action":"final","answer":"root-done"}' }
+      ])
+
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        max_depth: 1,
+        backend_client: shared_backend
+      )
+      result = client.completion(prompt: "compute")
+      expect(result.response).to eq("root-done")
+    end
+
+    it "returns plain string from single-shot fallback" do
+      backend = QueueBackend.new([
+        { text: "direct-answer" }
+      ])
+      client = described_class.new(
+        model_name: "gemini-2.5-flash",
+        api_key: "test-key",
+        backend_client: backend,
+        max_depth: 0
+      )
+      answer = client.send(:llm_query, "question")
+      expect(answer).to eq("direct-answer")
+      expect(answer).to be_a(String)
+      expect(answer).not_to be_a(RubyRLM::EpisodeResult)
+    end
+  end
+
+  it "includes model roster in system prompt" do
+    prompt = RubyRLM::Prompts::SystemPrompt.build
+    expect(prompt).to include("gemini-2.0-flash-lite")
+    expect(prompt).to include("gemini-2.5-pro")
+    expect(prompt).to include("model_name:")
   end
 
   it "uses DockerRepl when environment is docker and shuts it down" do

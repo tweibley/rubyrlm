@@ -7,6 +7,9 @@ module RubyRLM
     DEFAULT_MAX_ITERATIONS = 30
     DEFAULT_ITERATION_TIMEOUT = 60
     DEFAULT_MAX_MESSAGES = 50
+    DEFAULT_COMPACTION = true
+    DEFAULT_COMPACTION_THRESHOLD = 0.7
+    DEFAULT_COMPACTION_MODEL = Compaction::MessageCompactor::DEFAULT_COMPACTION_MODEL
 
     attr_reader :backend, :model_name, :max_depth, :max_iterations, :max_messages, :depth
 
@@ -26,6 +29,12 @@ module RubyRLM
       environment_options: {},
       iteration_timeout: DEFAULT_ITERATION_TIMEOUT,
       max_messages: DEFAULT_MAX_MESSAGES,
+      compaction: DEFAULT_COMPACTION,
+      compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
+      compaction_model: DEFAULT_COMPACTION_MODEL,
+      subcall_model: nil,
+      budget: nil,
+      budget_tracker: nil,
       parent_run_id: nil,
       run_id: nil,
       run_metadata: {},
@@ -55,6 +64,16 @@ module RubyRLM
       @action_parser = Protocol::ActionParser.new
       @backend_client = backend_client || build_backend_client(model_name: @model_name)
       @sub_call_cache = SubCallCache.new
+      @compaction_model = compaction_model.to_s
+      @compactor = Compaction::MessageCompactor.new(
+        enabled: compaction,
+        threshold: compaction_threshold,
+        max_messages: @max_messages,
+        compaction_model: @compaction_model,
+        backend_builder: method(:build_backend_client)
+      )
+      @subcall_model = subcall_model
+      @budget_tracker = budget_tracker || build_budget_tracker(budget)
       @current_run_id = nil
 
       validate_config!
@@ -75,7 +94,8 @@ module RubyRLM
         depth: @depth,
         max_depth: @max_depth,
         max_iterations: @max_iterations,
-        iterations: []
+        iterations: [],
+        compaction_events: []
       }
       metadata[:container_id] = repl.container_id if repl.respond_to?(:container_id) && repl.container_id
 
@@ -110,7 +130,17 @@ module RubyRLM
       final_answer = nil
 
       1.upto(@max_iterations) do |iteration|
-        turn = request_action(messages: messages, usage_summary: usage_summary)
+        if @budget_tracker&.exceeded?
+          verbose_log("budget_exceeded", "stopping iteration loop — budget exceeded")
+          break
+        end
+
+        begin
+          turn = request_action(messages: messages, usage_summary: usage_summary)
+        rescue BudgetExceededError
+          verbose_log("budget_exceeded", "stopping iteration loop — budget exceeded during request_action")
+          break
+        end
         action = turn.fetch(:action)
         raw_text = turn.fetch(:raw_text)
         verbose_log(
@@ -126,7 +156,7 @@ module RubyRLM
           feedback = execution_feedback(execution)
           messages << { role: "assistant", content: raw_text }
           messages << { role: "user", content: feedback }
-          truncate_messages!(messages)
+          maybe_compact_and_truncate!(messages, metadata: metadata, usage_summary: usage_summary)
           iteration_data = {
             iteration: iteration,
             action: "exec",
@@ -176,6 +206,7 @@ module RubyRLM
       end
       cache_stats = @sub_call_cache.stats
       metadata[:sub_call_cache] = cache_stats if cache_stats[:hits] > 0 || cache_stats[:misses] > 0
+      metadata[:budget] = @budget_tracker.stats if @budget_tracker
 
       result = CompletionResult.new(
         response: final_answer,
@@ -204,6 +235,8 @@ module RubyRLM
       raise ConfigurationError, "max_depth must be >= 0" if @max_depth.to_i.negative?
       raise ConfigurationError, "max_iterations must be > 0" unless @max_iterations.to_i.positive?
       raise ConfigurationError, "max_messages must be >= 4" unless @max_messages.to_i >= 4
+      raise ConfigurationError, "compaction_threshold must be between 0.1 and 1.0" unless
+        @compactor.threshold.between?(0.1, 1.0)
     end
 
     def validate_docker_options!
@@ -337,6 +370,7 @@ module RubyRLM
           request_action_blocking(messages: messages)
         end
       usage_summary.add(response[:usage], model: @model_name)
+      charge_budget(response[:usage])
       raw_text = response.fetch(:text).to_s
       action = @action_parser.parse(raw_text)
       {
@@ -354,6 +388,7 @@ module RubyRLM
       ]
       repaired = request_action_blocking(messages: repair_messages)
       usage_summary.add(repaired[:usage], model: @model_name)
+      charge_budget(repaired[:usage])
       repaired_raw = repaired.fetch(:text).to_s
       action = @action_parser.parse(repaired_raw)
       verbose_block("repaired_action_response", repaired_raw)
@@ -453,6 +488,15 @@ module RubyRLM
           error: e.message
         }
       }
+    rescue BudgetExceededError => e
+      {
+        answer: "[Budget exceeded: #{e.message}]",
+        iteration_data: {
+          iteration: @max_iterations + 1,
+          action: "forced_final",
+          answer: "[Budget exceeded: #{e.message}]"
+        }
+      }
     end
 
     def execution_feedback(execution_result)
@@ -476,13 +520,23 @@ module RubyRLM
     end
 
     def llm_query(sub_prompt, model_name: nil)
-      effective_model = model_name || @model_name
+      effective_model = model_name || @subcall_model || @model_name
 
       # Check sub-call cache
       cached = @sub_call_cache.get(sub_prompt, model_name: effective_model)
       if cached
         verbose_log("subcall_cache_hit", "model=#{effective_model} prompt=#{truncate(sub_prompt.to_s, 100)}")
         return cached
+      end
+
+      # Check budget before making a subcall
+      if @budget_tracker
+        begin
+          @budget_tracker.check_subcall!
+        rescue BudgetExceededError => e
+          verbose_log("budget_exceeded", e.message)
+          return "[Budget exceeded: #{e.message}]"
+        end
       end
 
       if @depth < @max_depth
@@ -505,20 +559,26 @@ module RubyRLM
           environment: @environment,
           environment_options: @environment_options,
           iteration_timeout: @iteration_timeout,
+          subcall_model: @subcall_model,
+          budget_tracker: @budget_tracker,
+          compaction: @compactor.enabled,
+          compaction_threshold: @compactor.threshold,
+          compaction_model: @compaction_model,
           parent_run_id: @current_run_id,
           run_metadata: {},
           backend_client: effective_model == @model_name ? @backend_client : nil
         )
-        response = child.completion(prompt: sub_prompt, root_prompt: "Recursive sub-call. Solve only this scoped sub-problem.").response
-        verbose_block("subcall_end", response)
-        @sub_call_cache.put(sub_prompt, model_name: effective_model, response: response)
-        return response
+        child_result = child.completion(prompt: sub_prompt, root_prompt: "Recursive sub-call. Solve only this scoped sub-problem.")
+        episode_result = build_episode_result(child_result)
+        verbose_block("subcall_end", episode_result)
+        @sub_call_cache.put(sub_prompt, model_name: effective_model, response: episode_result)
+        return episode_result
       end
 
       verbose_log("subcall_fallback", "depth=#{@depth} max_depth=#{@max_depth} using single-shot completion")
       plain_backend =
-        if model_name && model_name != @model_name
-          build_backend_client(model_name: model_name)
+        if effective_model != @model_name
+          build_backend_client(model_name: effective_model)
         else
           @backend_client
         end
@@ -542,6 +602,12 @@ module RubyRLM
           plain_backend.complete(messages: subcall_messages, generation_config: subcall_config)
         end
       text = response.fetch(:text).to_s
+      begin
+        charge_budget(response[:usage], model_name: effective_model)
+      rescue BudgetExceededError => e
+        verbose_log("budget_exceeded", e.message)
+        return "[Budget exceeded: #{e.message}]"
+      end
       verbose_block("subcall_fallback_answer", text)
       @sub_call_cache.put(sub_prompt, model_name: effective_model, response: text)
       text
@@ -594,8 +660,87 @@ module RubyRLM
       end
     end
 
+    def build_episode_result(child_result)
+      iterations = child_result.metadata[:iterations] || []
+      episode = generate_episode_summary(iterations)
+      EpisodeResult.new(
+        child_result.response,
+        episode: episode,
+        iterations: iterations.length,
+        forced_final: child_result.metadata[:forced_final] || false
+      )
+    rescue StandardError => e
+      verbose_log("episode_error", "failed to generate episode: #{e.message}")
+      EpisodeResult.new(child_result.response, iterations: (child_result.metadata[:iterations] || []).length)
+    end
+
+    def generate_episode_summary(iterations)
+      return nil if iterations.empty?
+
+      parts = iterations.map do |iter|
+        case iter[:action]
+        when "exec"
+          exec_data = iter[:execution] || {}
+          status = exec_data[:ok] ? "ok" : "error: #{exec_data[:error_class]}"
+          "Step #{iter[:iteration]}: exec `#{truncate(iter[:code].to_s, 100)}` → #{status}"
+        when "final"
+          "Step #{iter[:iteration]}: final answer"
+        when "forced_final"
+          "Step #{iter[:iteration]}: forced final (iteration limit)"
+        else
+          "Step #{iter[:iteration]}: #{iter[:action]}"
+        end
+      end
+
+      parts.join("\n")
+    end
+
+    def build_budget_tracker(budget)
+      return nil if budget.nil? || (budget.is_a?(Hash) && budget.empty?)
+
+      opts = budget.to_h.transform_keys(&:to_sym)
+      BudgetTracker.new(**opts)
+    end
+
+    def charge_budget(usage_hash, model_name: @model_name)
+      return unless @budget_tracker
+      return unless usage_hash.is_a?(Hash)
+
+      usage = usage_hash.to_h.transform_keys(&:to_sym)
+      tokens = Integer(usage[:total_tokens] || 0)
+      cost = Pricing.cost_for(
+        model: model_name,
+        input_tokens: Integer(usage[:prompt_tokens] || 0),
+        cached_tokens: Integer(usage[:cached_content_tokens] || 0),
+        output_tokens: Integer(usage[:candidate_tokens] || 0)
+      )
+      @budget_tracker.add_usage(tokens: tokens, cost: cost)
+    end
+
     def indent_multiline(text)
       text.lines.map { |line| "  #{line}" }.join
+    end
+
+    def maybe_compact_and_truncate!(messages, metadata:, usage_summary:)
+      result = @compactor.maybe_compact!(messages)
+      if result.compacted
+        usage_summary.add(result.usage, model: @compaction_model)
+        metadata[:compaction_events] << {
+          messages_before: result.messages_before,
+          messages_after: result.messages_after,
+          latency_s: result.latency_s,
+          model: @compaction_model
+        }
+        verbose_log(
+          "compaction",
+          "compacted #{result.messages_before} -> #{result.messages_after} messages in #{format('%.2f', result.latency_s)}s"
+        )
+      end
+      truncate_messages!(messages)
+    rescue CompactionError => e
+      verbose_log("compaction_error", "falling back to truncation: #{e.message}")
+      log_event(type: "compaction_error", run_id: @current_run_id, error: e.message)
+      truncate_messages!(messages)
     end
 
     def truncate_messages!(messages)

@@ -28,7 +28,14 @@ module RubyRLM
           2) `llm_query(sub_prompt, model_name: nil)` is available.
              - It recursively calls an LLM and returns its answer as a String.
              - When recursion depth is capped, it falls back to a single-shot model call.
+             - Use `model_name:` to route to a specific model for cost/capability trade-offs.
+             - Available models (cheapest to most capable): #{Pricing.model_names.join(', ')}
+             - Tip: use a cheaper model (e.g. flash-lite or flash) for data extraction and summarization.
+             - When recursion is available, the return value carries episode metadata:
+               `result.episode` (summary of steps taken), `result.iterations` (count), `result.forced_final` (bool).
+             - The return value works as a plain String in all contexts (backward compatible).
              - Example: `summary = llm_query("Summarize this content in 3 bullets")`
+             - Example: `answer = llm_query("Complex reasoning task", model_name: "gemini-2.5-pro")`
           3) The last evaluated expression in your `exec` code is automatically returned as `value_preview`.
              - Use `print(...)` / `puts(...)` when you need multiple intermediate outputs.
           4) REPL state persists across turns.
@@ -42,7 +49,13 @@ module RubyRLM
              - It raises if `old_text` is missing, appears multiple times, or filesystem access is disabled.
           8) `grep(pattern, path: ".")` searches with ripgrep when filesystem access is available.
              - Returns an array of `{path:, line:, text:}` matches.
-          9) `chunk_text(text, max_length: 2000)` splits long text semantically.
+          9) `parallel_queries(*prompts, max_concurrency: 5)` runs multiple `llm_query` calls concurrently.
+             - Accepts strings or hashes with `{prompt:, model_name:}` for per-query model routing.
+             - Returns an array of results in the same order as the input prompts.
+             - Use for independent subtasks: summarizing multiple chunks, analyzing multiple files, etc.
+             - Example: `results = parallel_queries("Summarize A", "Summarize B", "Summarize C")`
+             - Example: `results = parallel_queries({prompt: "Q1", model_name: "gemini-2.5-flash"}, {prompt: "Q2"})`
+          10) `chunk_text(text, max_length: 2000)` splits long text semantically.
              - It prefers paragraph/sentence boundaries before hard wrapping.
 
           Runtime environment:

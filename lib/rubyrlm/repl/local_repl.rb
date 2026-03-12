@@ -7,6 +7,7 @@ require "net/http"
 require "open3"
 require "pathname"
 require "uri"
+require "monitor"
 
 module RubyRLM
   module Repl
@@ -78,6 +79,7 @@ module RubyRLM
         @llm_query_proc = llm_query_proc
         @timeout_seconds = timeout_seconds
         @workspace_root = Pathname.new(Dir.pwd).expand_path
+        @execute_mutex = Monitor.new
         @modifications = []
         @host = Object.new
         @host.instance_variable_set(:@context, @context)
@@ -99,6 +101,13 @@ module RubyRLM
           )
         end
 
+        # Serialize execute calls so concurrent threads don't clobber $stdout/$stderr
+        @execute_mutex.synchronize { execute_inner(code, warnings) }
+      end
+
+      private
+
+      def execute_inner(code, warnings)
         stdout_buffer = StringIO.new
         stderr_buffer = StringIO.new
         prior_stdout = $stdout
@@ -145,8 +154,6 @@ module RubyRLM
         end
       end
 
-      private
-
       def install_helpers
         query_proc = @llm_query_proc
         fetch_proc = method(:fetch_url)
@@ -175,6 +182,27 @@ module RubyRLM
         end
         @host.define_singleton_method(:chunk_text) do |text, max_length: 2000|
           chunk_proc.call(text, max_length: max_length)
+        end
+        @host.define_singleton_method(:parallel_queries) do |*queries, max_concurrency: 5|
+          queries = queries.flatten(1)
+          queries.each_slice(max_concurrency).flat_map do |batch|
+            threads = batch.map do |q|
+              Thread.new do
+                if q.is_a?(Hash)
+                  query_proc.call(q[:prompt] || q["prompt"], model_name: q[:model_name] || q["model_name"])
+                else
+                  query_proc.call(q.to_s)
+                end
+              rescue => e
+                e
+              end
+            end
+            results = threads.map(&:value)
+            # Re-raise first error after all threads have completed
+            first_error = results.find { |r| r.is_a?(Exception) }
+            raise first_error if first_error
+            results
+          end
         end
       end
 

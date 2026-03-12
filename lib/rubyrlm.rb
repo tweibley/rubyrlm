@@ -9,9 +9,13 @@ require_relative "rubyrlm/repl/code_validator"
 require_relative "rubyrlm/repl/local_repl"
 require_relative "rubyrlm/repl/docker_repl"
 require_relative "rubyrlm/prompts/system_prompt"
+require_relative "rubyrlm/prompts/compaction_prompt"
+require_relative "rubyrlm/compaction/message_compactor"
 require_relative "rubyrlm/protocol/action_parser"
 require_relative "rubyrlm/logger/jsonl_logger"
 require_relative "rubyrlm/sub_call_cache"
+require_relative "rubyrlm/episode_result"
+require_relative "rubyrlm/budget_tracker"
 require_relative "rubyrlm/client"
 
 module RubyRLM

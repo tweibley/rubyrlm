@@ -83,6 +83,17 @@ module RubyRLM
       end
     end
 
+    # Return the list of known model names, sorted cheapest-first by input rate.
+    def self.model_names
+      RATES.keys.sort_by do |name|
+        rate = RATES[name]
+        case rate
+        when Array then rate.first[:input]
+        when Hash then rate[:input]
+        end
+      end
+    end
+
     private_class_method :resolve_rate, :select_tier
   end
 end
