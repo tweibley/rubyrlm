@@ -10,8 +10,13 @@ RubyRLM is an MVP Ruby implementation of Recursive Language Models (RLMs) that u
 - Gemini backend via direct REST (`generateContent`).
 - Local and Docker-isolated REPL backends with iterative `exec` actions and `final` answer action.
 - Recursive sub-calls with `llm_query(...)` up to `max_depth`.
+- **Context compaction** — LLM-powered compression of older conversation messages to preserve strategic context as iterations grow.
+- **Budget guards** — Aggregate subcall, token, and cost limits shared across the entire recursion tree.
+- **Cross-model routing** — Route subcalls to cheaper models by default via `subcall_model:`, with a model roster in the system prompt.
+- **Rich subcall returns** — `llm_query` returns `EpisodeResult` objects carrying episode metadata (summary, iteration count) from recursive subcalls.
+- **Parallel subcall dispatch** — `parallel_queries` helper for concurrent `llm_query` execution via Ruby threads.
 - **AST code validation** — Ripper-based syntax checking and dangerous call detection before eval.
-- **Sub-call caching** — SHA256-keyed deduplication of `llm_query` calls within a session.
+- **Sub-call caching** — Thread-safe SHA256-keyed deduplication of `llm_query` calls within a session.
 - **Patch tracking** — Audit trail for all `patch_file` operations with undo support.
 - JSONL trajectory logging for iteration debugging.
 - Web UI with session replay, continuation, and environment selection.
@@ -173,7 +178,8 @@ If model output is malformed, RubyRLM issues one repair re-prompt. If `max_itera
 Within `exec` code:
 
 - `context` is the original prompt/context
-- `llm_query(sub_prompt, model_name: nil)` launches a recursive sub-call
+- `llm_query(sub_prompt, model_name: nil)` launches a recursive sub-call (returns `EpisodeResult` with `.episode`, `.iterations`, `.forced_final` metadata)
+- `parallel_queries(*prompts, max_concurrency: 5)` runs multiple `llm_query` calls concurrently (accepts strings or `{prompt:, model_name:}` hashes)
 - `fetch(url, headers: {})` performs HTTP GET with redirect following
 - `sh(command, timeout: 5)` runs a shell command safely
 - `patch_file(path, old_text, new_text)` replaces text exactly once (tracked for undo)
@@ -195,6 +201,88 @@ result = client.completion(prompt: data)
 puts result.metadata[:sub_call_cache]
 # => { hits: 3, misses: 2, size: 2 }
 ```
+
+## Context Compaction
+
+When conversation history grows long, RubyRLM can compress older messages into structured summaries using a lightweight LLM call, preserving strategic context while freeing up the context window:
+
+```ruby
+client = RubyRLM::Client.new(
+  model_name: "gemini-3.1-pro-preview",
+  api_key: ENV["GEMINI_API_KEY"],
+  compaction: true,              # enabled by default
+  compaction_threshold: 0.7,     # trigger at 70% of max_messages
+  compaction_model: "gemini-2.0-flash-lite"  # cheap model for summarization
+)
+```
+
+Compaction events are recorded in the completion metadata:
+
+```ruby
+result.metadata[:compaction_events]
+# => [{ messages_before: 35, messages_after: 3, latency_s: 0.8 }]
+```
+
+## Budget Guards
+
+Enforce aggregate limits on subcalls, tokens, and cost across the entire recursion tree:
+
+```ruby
+client = RubyRLM::Client.new(
+  model_name: "gemini-3.1-pro-preview",
+  api_key: ENV["GEMINI_API_KEY"],
+  budget: {
+    max_subcalls: 25,
+    max_total_tokens: 500_000,
+    max_cost_usd: 1.00
+  }
+)
+```
+
+Budget stats are included in the completion result:
+
+```ruby
+result.metadata[:budget]
+# => { subcalls: 12, total_tokens: 84000, total_cost: 0.042, limits: { max_subcalls: 25, ... } }
+```
+
+When a budget limit is reached, the client forces a final answer gracefully rather than raising an error.
+
+## Cross-Model Routing
+
+Route subcalls to a cheaper model by default while keeping a capable model for orchestration:
+
+```ruby
+client = RubyRLM::Client.new(
+  model_name: "gemini-3.1-pro-preview",       # orchestrator
+  api_key: ENV["GEMINI_API_KEY"],
+  subcall_model: "gemini-3.1-flash-lite-preview"  # default for llm_query subcalls
+)
+```
+
+The system prompt includes a model roster sorted by cost, so the LLM can make informed routing decisions. Explicit `model_name:` in `llm_query` calls overrides the default.
+
+## Parallel Subcall Dispatch
+
+Run multiple `llm_query` calls concurrently for independent subtasks:
+
+```ruby
+# Inside exec code
+results = parallel_queries(
+  "Summarize section A",
+  "Summarize section B",
+  "Summarize section C"
+)
+
+# With per-query model routing
+results = parallel_queries(
+  { prompt: "Extract data", model_name: "gemini-3.1-flash-lite-preview" },
+  { prompt: "Analyze trends", model_name: "gemini-3.1-pro-preview" },
+  max_concurrency: 3
+)
+```
+
+Thread safety is handled internally — `SubCallCache` and `BudgetTracker` use Monitor-based synchronization.
 
 ## Patch Tracking & Undo
 
@@ -290,13 +378,10 @@ Events are written per-run as JSONL and include:
 
 - `examples/quickstart.rb`: single prompt run with logger
 - `examples/needle_in_haystack.rb`: synthetic long-context retrieval task
+- `examples/parallel_analysis.rb`: parallel review analysis with cross-model routing and budget guards
 
 ## Testing
 
 ```bash
 bundle exec rspec
 ```
-
-## Future Extensions
-
-- More backend adapters

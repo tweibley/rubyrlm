@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-03-12
+
+### Added
+- Context compaction — LLM-powered compression of older conversation messages to preserve strategic context as iterations grow
+- Budget guards — aggregate subcall, token, and cost limits shared across the entire recursion tree via thread-safe `BudgetTracker`
+- Cross-model routing — `subcall_model:` config to route subcalls to cheaper models by default, with model roster in system prompt
+- Rich subcall returns — `EpisodeResult` (String subclass) carries episode metadata from recursive subcalls
+- Parallel subcall dispatch — `parallel_queries` REPL helper for concurrent `llm_query` execution with configurable `max_concurrency`
+- Thread-safe `SubCallCache` using Monitor synchronization
+- `Pricing.model_names` for sorted model roster
+- `CompactionError` and `BudgetExceededError` error types
+- `examples/parallel_analysis.rb` demonstrating all new features
+- `docs/analysis/slate-takeaways.md` with Slate blog post analysis
+- Implementation plan documents in `docs/plans/`
+
 ## [0.1.0] - 2026-03-12
 
 ### Added
